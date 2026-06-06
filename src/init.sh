@@ -23,6 +23,20 @@ if [ -n "${SUTANDO_WORKSPACE:-}" ]; then
   WORKSPACE="${SUTANDO_WORKSPACE/#\~/$HOME}"
 else
   WORKSPACE="$HOME/.sutando/workspace"
+  # Surface the silent-fallback bug class (see PR #1367/#1368): if .env
+  # defines SUTANDO_WORKSPACE but this process never got it (e.g. init.sh
+  # invoked by a bootstrap path that skips startup.sh's .env-source), the
+  # fallback lands in ~/.sutando/workspace/ while the rest of the fleet
+  # uses the override → split-brain. One stderr line per init.sh run
+  # makes the miss visible. We do NOT auto-honor the .env value here —
+  # only surface the mismatch.
+  if [ -f "$REPO/.env" ]; then
+    _env_val=$(grep -E '^SUTANDO_WORKSPACE=' "$REPO/.env" 2>/dev/null | head -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" -e "s|^~|$HOME|")
+    if [ -n "$_env_val" ] && [ "$_env_val" != "$WORKSPACE" ]; then
+      echo "workspace: SUTANDO_WORKSPACE is unset in process env, falling back to $WORKSPACE. NOTE: .env declares SUTANDO_WORKSPACE='$_env_val' which is NOT being honored here — source .env or export the var before this process to avoid split-brain with other services." >&2
+    fi
+    unset _env_val
+  fi
 fi
 
 case "$MODE" in
@@ -163,16 +177,56 @@ migrate_root_status_to_state() {
   fi
 }
 
+# One-time stderr notice when legacy repo-root state is detected. Replaces
+# the auto-fire of migrate_legacy_runtime_state / migrate_root_status_to_state
+# from tier1() — see #1169 / #1170 (option B: auto-migration disabled).
+#
+# Scans for evidence the bash twins would have moved (a) on a fresh
+# install or (b) on a populated-workspace collision where the old
+# migrator would have skipped the move silently. Both cases now require
+# explicit invocation of `bash scripts/sutando-migrate.sh`.
+legacy_state_notice() {
+  local notice_sentinel="$WORKSPACE/.legacy-notice-printed"
+  if [ -f "$notice_sentinel" ]; then
+    return 0
+  fi
+  local found=()
+  for d in logs state tasks results notes data; do
+    if [ -d "$REPO/$d" ] && [ ! -L "$REPO/$d" ] && [ -n "$(ls -A "$REPO/$d" 2>/dev/null)" ]; then
+      found+=("$REPO/$d/")
+    fi
+  done
+  for f in pending-questions.md core-status.json contextual-chips.json voice-state.json build_log.md conversation.log; do
+    if [ -f "$REPO/$f" ]; then
+      found+=("$REPO/$f")
+    fi
+  done
+  for f in core-status.json voice-state.json contextual-chips.json dynamic-content.json quota-state.json; do
+    if [ -f "$WORKSPACE/$f" ]; then
+      found+=("$WORKSPACE/$f (should be in state/)")
+    fi
+  done
+  if [ "${#found[@]}" -gt 0 ]; then
+    mkdir -p "$WORKSPACE"
+    {
+      echo "  ⚠ legacy state detected: ${found[*]}"
+      echo "    Auto-migration is disabled as of #1169 (option B)."
+      echo "    Run \`bash scripts/sutando-migrate.sh --dry-run\` to preview, then \`--commit\` to relocate."
+    } >&2
+    : > "$notice_sentinel"
+  fi
+}
+
 # --- Tier 1: auto-bootstrap (always safe to run) ---
 tier1() {
   log "Tier 1 — auto-bootstrap..."
 
-  # First-run sweep: any stale repo-root runtime state lands in workspace
-  # before we start creating fresh files. Idempotent + non-destructive.
-  migrate_legacy_runtime_state
-  # Then sweep loose workspace-root status files into state/ — must run
-  # before the create_file_if_missing calls below.
-  migrate_root_status_to_state
+  # Auto-migration disabled (closes #1169 option B, 2026-05-26).
+  # The two migrate_* functions above are kept defined so a future
+  # `scripts/sutando-migrate.sh` CLI can invoke them explicitly, but they
+  # are no longer dispatched on every startup. One-time stderr notice
+  # below points users at the CLI when legacy state is detected.
+  legacy_state_notice
 
   # Directories
   create_dir_if_missing "logs"

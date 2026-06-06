@@ -58,6 +58,15 @@ def _resolve_note_path(raw_slug: str):
     return Path(note_file_str)
 
 
+def get_outbox(limit: int = 10) -> list[dict]:
+    """Return recent outbox entries for the dashboard card."""
+    try:
+        import outbox_log
+        return outbox_log.read_recent(limit)
+    except Exception:
+        return []
+
+
 def get_health() -> list[dict]:
     # Use sys.executable so the subprocess uses the same Python that's
     # running dashboard itself (typically homebrew 3.11). When launchd
@@ -94,11 +103,11 @@ def get_activity(max_items: int = 10) -> list[dict]:
                 from datetime import datetime
                 dt = datetime.strptime(date_str.strip()[:19], '%Y-%m-%d %H:%M:%S')
                 time_str = dt.strftime('%b %d %H:%M')
-            except:
+            except Exception:
                 time_str = date_str[:16]
             entries.append({'time': time_str, 'title': msg.strip(), 'body': sha})
         return entries
-    except:
+    except Exception:
         return []
 
 
@@ -107,8 +116,13 @@ def get_pending_count() -> dict:
     if not pending_file.exists():
         return {"open": 0, "done": 0}
     content = pending_file.read_text()
-    open_count = len(re.findall(r'\*\*Status:\*\* Waiting', content))
-    done_count = len(re.findall(r'\*\*Status:\*\* Answered', content))
+    # Questions are filed as free-form `## ` sections (no **Status:** field — see
+    # #1265) and moved below a top-level `# Resolved` divider once answered. The
+    # old `**Status:** Waiting/Answered` regex matched neither and always returned
+    # 0/0 for the format actually in use — count `## ` sections per region instead.
+    active, _, resolved = content.partition('\n# Resolved')
+    open_count = len(re.findall(r'^## ', active, flags=re.MULTILINE))
+    done_count = len(re.findall(r'^## ', resolved, flags=re.MULTILINE))
     return {"open": open_count, "done": done_count}
 
 
@@ -315,6 +329,29 @@ def render_dashboard() -> str:
     matrix_html = get_use_case_matrix()
     if matrix_html:
         cards.append(f'<div class="card full"><h2>Capabilities Matrix</h2>{matrix_html}</div>')
+
+    # Outbox (recent outbound messages)
+    outbox = get_outbox(10)
+    if outbox:
+        _channel_icon = {
+            "discord_dm": "💬", "discord_channel": "📢",
+            "slack_dm": "💬", "slack_channel": "📢",
+            "telegram": "✈️", "imessage": "💬", "whatsapp": "📱",
+            "email": "📧", "x": "𝕏",
+        }
+        outbox_html = ""
+        for e in reversed(outbox):
+            icon = _channel_icon.get(e.get("channel_type", ""), "→")
+            ts_str = e.get("iso_ts", "")[:16].replace("T", " ")
+            label = e.get("recipient_label") or e.get("recipient", "?")[:20]
+            preview = e.get("body_preview", "")[:80]
+            outbox_html += (
+                f'<div class="activity-item">'
+                f'<span class="activity-time">{ts_str} {icon} {label}</span> '
+                f'<span class="activity-title" style="color:#666">{preview}</span>'
+                f'</div>\n'
+            )
+        cards.append(f'<div class="card full"><h2>Outbox</h2>{outbox_html}</div>')
 
     # Keyboard shortcuts
     # Match both the dev-built binary (`<repo>/src/Sutando/Sutando`) and the

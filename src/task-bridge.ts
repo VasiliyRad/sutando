@@ -301,6 +301,22 @@ export const workTool: ToolDefinition = {
 		// shape as agent-api.py's /task endpoint after PR #982; consumers
 		// (`_isVoiceTask`, `parse_priority_from_text`) stop scanning at
 		// the first `task:` line.
+		// Attach a short window of recent conversation AFTER the `task:` line so
+		// the core can self-correct a misheard/garbled transcript (per Chi: "the
+		// voice agent may mishear and pass the wrong transcripts"). It lands in
+		// the task BODY (everything after `task:`), so it cannot forge header
+		// fields — consumers stop scanning headers at the first `task:` line.
+		// Best-effort: empty string if no log/session yet.
+		let contextBlock = '';
+		try {
+			const recent = getRecentConversation(4);
+			if (recent) {
+				contextBlock =
+					`\n\n--- recent voice transcript (may contain ASR errors; if the task above ` +
+					`seems garbled or doesn't match this, infer the true intent from it or ask to ` +
+					`confirm before acting) ---\n${recent}\n`;
+			}
+		} catch { /* best effort — never block delegation on context attach */ }
 		const content =
 			`id: ${taskId}\n` +
 			`timestamp: ${timestamp}\n` +
@@ -309,7 +325,7 @@ export const workTool: ToolDefinition = {
 			`user_id: ${ownerId}\n` +
 			`access_tier: owner\n` +
 			`priority: urgent\n` +
-			`task: ${task}\n`;
+			`task: ${task}${contextBlock}\n`;
 		writeFileSync(join(TASK_DIR, `${taskId}.txt`), content);
 		// Resolve per-task timeout. 0 → no timeout. Negative or NaN → default.
 		// Cap at 6 hours to prevent runaway pending-state if the voice agent
@@ -721,6 +737,29 @@ export function startResultWatcher(onResult: (result: string) => void, isClientC
 							const taskFile = join(TASK_DIR, `${taskId}.txt`);
 							if (existsSync(taskFile)) archiveFile(taskFile, 'tasks', taskId);
 						}, 10_000);
+					}
+					// Context-drop tasks: Sutando.app writes `source: context-drop` (no bridge
+					// handles delivery). Archive them directly so they don't pile up indefinitely.
+					// Companion fix: Sutando.app main.swift writeTask() must include this field.
+					// Issue: https://github.com/sonichi/sutando/issues/969
+					if (taskId.startsWith('task-')) {
+						const ctxTaskFile = join(TASK_DIR, `${taskId}.txt`);
+						if (existsSync(ctxTaskFile)) {
+							try {
+								const taskBody = readFileSync(ctxTaskFile, 'utf-8');
+								if (/^source:\s*context-drop/m.test(taskBody)) {
+									_sendTaskStatus?.(taskId, 'done', result.slice(0, 60), result);
+									_deliveredResults.add(file);
+									_pendingTasks.delete(taskId);
+									console.log(`${ts()} [TaskBridge] Context-drop task archived (no client): ${taskId}`);
+									setTimeout(() => {
+										archiveFile(path, 'results', taskId);
+										if (existsSync(ctxTaskFile)) archiveFile(ctxTaskFile, 'tasks', taskId);
+									}, 10_000);
+									continue;
+								}
+							} catch {}
+						}
 					}
 					// Other non-voice unsent results stay queued (their bridges deliver them)
 					continue;

@@ -217,6 +217,17 @@ export function callRestoreTools(): boolean {
 	return true;
 }
 
+/**
+ * The full tool surface registered at startup (e.g. voice-agent's
+ * `mainAgentTools` = workTool + switchModeTool + … + inlineTools). Empty until
+ * setSessionToolUpdater() runs. Skills that need to RESTRICT the surface should
+ * filter THIS, not `inlineTools` alone — otherwise the non-inline mainAgentTools
+ * (work, switch_mode, …) are silently dropped and become uncallable in-mode.
+ */
+export function getFullToolSurface(): ToolDefinition[] {
+	return fullToolSurface;
+}
+
 function getSendFile(): ((b64: string, mime: string) => void) | null {
 	const t = sessionRef?.transport;
 	if (!t || !t.sendFile) return null;
@@ -338,7 +349,8 @@ export function startStreaming(
 		const info = startStream(source, fps ?? DEFAULT_FPS);
 		return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs, mode: 'pull' };
 	} catch (err) {
-		return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+		console.error(`${ts()} [Vision] startStreaming threw: ${(err as Error)?.message ?? err}`);
+		return { status: 'failed', error: 'startStreaming failed' };
 	}
 }
 
@@ -417,7 +429,7 @@ export function submitFrame(data: Buffer, mimeType: string = 'image/jpeg'): { ok
 		return { ok: true };
 	} catch (err) {
 		console.error(`${ts()} [Vision] sendFile threw: ${(err as Error)?.message ?? err}`);
-		return { ok: false, error: (err as Error)?.message ?? String(err) };
+		return { ok: false, error: 'submitFrame failed' };
 	}
 }
 
@@ -427,6 +439,20 @@ async function captureAndSend(source: VisionSource): Promise<{ ok: boolean; erro
 	const frame = await source.capture();
 	sendFile(frame.data.toString('base64'), frame.mimeType);
 	return { ok: true };
+}
+
+/** Capture a single frame from `sourceName` (default 'screen') and send it to
+ *  the active Gemini Live session as vision input. Pull-mode one-shot — does
+ *  not require push mode to be running. Returns `{ ok: false }` if no session
+ *  is connected or the source is unknown. */
+export async function captureSendFrame(sourceName?: string): Promise<{ ok: boolean; source?: string; error?: string }> {
+	try {
+		const source = resolveSource(sourceName);
+		const r = await captureAndSend(source);
+		return r.ok ? { ok: true, source: source.name } : r;
+	} catch (err) {
+		return { ok: false, error: (err as Error)?.message ?? String(err) };
+	}
 }
 
 async function tick(): Promise<void> {
@@ -489,7 +515,8 @@ export const sendVisionFrameTool: ToolDefinition = {
 			if (!r.ok) return { status: 'failed', error: r.error };
 			return { status: 'sent', source: source.name };
 		} catch (err) {
-			return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+			console.error(`${ts()} [Vision] sendVisionFrameTool threw: ${(err as Error)?.message ?? err}`);
+			return { status: 'failed', error: 'captureAndSend failed' };
 		}
 	},
 };
@@ -532,7 +559,8 @@ export const startVisionTool: ToolDefinition = {
 			const info = startStream(source, fps ?? DEFAULT_FPS);
 			return { status: 'streaming', source: source.name, fps: info.fps, intervalMs: info.intervalMs };
 		} catch (err) {
-			return { status: 'failed', error: (err as Error)?.message ?? String(err) };
+			console.error(`${ts()} [Vision] startVisionTool threw: ${(err as Error)?.message ?? err}`);
+			return { status: 'failed', error: 'startStream failed' };
 		}
 	},
 };

@@ -373,6 +373,40 @@ def _migrate_conversation_log(workspace: Path) -> bool:
     return moved
 
 
+_AUTO_MIGRATE_NOTICE_PRINTED = False
+_FALLBACK_WARN_PRINTED = False
+
+
+def _grep_env_for_workspace() -> str | None:
+    """Best-effort: read `SUTANDO_WORKSPACE=` from the repo's .env file.
+
+    Walks up from this module's resolved path to find the nearest `.env`,
+    then scans for a `SUTANDO_WORKSPACE=` line. Returns the (tilde-expanded)
+    value or None on any failure — never raises. Used only to enrich the
+    fallback-warn message below; resolution itself does NOT consume this
+    value, so a user who genuinely wants the default still gets it.
+    """
+    try:
+        cur = Path(__file__).resolve()
+        for _ in range(5):
+            cur = cur.parent
+            if cur == cur.parent:  # filesystem root
+                return None
+            env_file = cur / ".env"
+            if env_file.is_file():
+                for line in env_file.read_text().splitlines():
+                    s = line.strip()
+                    if s.startswith("SUTANDO_WORKSPACE="):
+                        val = s.split("=", 1)[1].strip()
+                        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                            val = val[1:-1]
+                        return str(Path(val).expanduser()) if val else None
+                return None
+    except Exception:
+        pass
+    return None
+
+
 def resolve_workspace(migrate: bool = True) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
@@ -380,24 +414,40 @@ def resolve_workspace(migrate: bool = True) -> Path:
       1. `$SUTANDO_WORKSPACE` env var, expanded (`~` honored).
       2. `~/.sutando/workspace/`.
 
-    When `migrate=True` (default) the function ALSO runs one-time
-    auto-migrations:
-      • `_migrate_from_legacy` — fires when env is unset and the new default
-        doesn't yet exist; pulls tasks/results/state/notes from the legacy
-        repo-root fallback.
-      • `_migrate_inrepo_notes` — fires when workspace != repo root; pulls
-        top-level notes/*.md|*.txt from the in-repo `notes/` dir into
-        `<workspace>/notes/`.
-      • `_migrate_inrepo_build_log` — fires when workspace != repo root; moves
-        in-repo `build_log.md` to `<workspace>/build_log.md`.
-      • `_migrate_root_status` — sweeps loose workspace-root status `.json`
-        files into `<workspace>/state/`.
-      • `_migrate_conversation_log` — moves `<workspace>/conversation.log` into
-        `<workspace>/logs/`.
-
     Returns a `Path` — does NOT create the directory; the caller decides.
-    Pass `migrate=False` from tests that want pure resolution semantics.
+
+    **Auto-migration disabled (closes #1169 option B, 2026-05-26.)**
+
+    Previously this function auto-ran 5 destructive migrators
+    (`_migrate_from_legacy`, `_migrate_inrepo_notes`,
+    `_migrate_inrepo_build_log`, `_migrate_root_status`,
+    `_migrate_conversation_log`) on every call. The semantic was
+    "implicit one-way `shutil.move` whenever the resolver sees an
+    eligible source" — which destroyed an uncommitted file on
+    2026-05-25 when `tests/discord_config.test.py` set
+    `SUTANDO_WORKSPACE=tmpdir` and the symlinked `<repo>/notes/`
+    (memory-sync target) was relocated into the tmpdir, then deleted
+    when `tempfile.TemporaryDirectory` cleaned up. See incident
+    write-up at the top of #1169.
+
+    The five migrators remain defined in this module (their bodies
+    are untouched and their direct-call tests still pass); they are
+    no longer dispatched from `resolve_workspace()`. They will be
+    re-introduced via an explicit `sutando-migrate` CLI in a
+    follow-up — opt-in, with `--dry-run`, `--commit`, and a
+    once-per-host sentinel. Users with legacy in-repo state will see
+    a one-time stderr notice the first time this function runs
+    pointing them at the CLI.
+
+    The `migrate` keyword is kept for backwards compatibility with
+    callers that previously passed `migrate=False`. Passing
+    `migrate=False` ALSO skips the legacy-state stderr notice — the
+    function stays pure (no scan, no I/O on the legacy root, no
+    stderr output beyond the relative-path warning). Pass
+    `migrate=True` (the default) to let the one-time notice fire.
     """
+    global _AUTO_MIGRATE_NOTICE_PRINTED
+
     env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
     if env:
         target = Path(env).expanduser()
@@ -419,40 +469,58 @@ def resolve_workspace(migrate: bool = True) -> Path:
                 file=sys.stderr,
             )
             target = anchored
-        if migrate:
-            try:
-                _migrate_inrepo_notes(target)
-            except Exception as e:  # pragma: no cover — must never break resolution
-                print(f"notes migration: skipped due to error: {e}", file=sys.stderr)
-            try:
-                _migrate_inrepo_build_log(target)
-            except Exception as e:  # pragma: no cover — must never break resolution
-                print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
-            try:
-                _migrate_root_status(target)
-            except Exception as e:  # pragma: no cover — must never break resolution
-                print(f"status migration: skipped due to error: {e}", file=sys.stderr)
-            try:
-                _migrate_conversation_log(target)
-            except Exception as e:  # pragma: no cover — must never break resolution
-                print(f"conversation.log migration: skipped due to error: {e}", file=sys.stderr)
-        return target
-    target = default_workspace_dir()
-    if migrate:
+    else:
+        target = default_workspace_dir()
+        # Surface the silent-fallback bug class (see PR #1367/#1368): if .env
+        # defines SUTANDO_WORKSPACE but the process never got it (e.g. a
+        # SessionStart hook, launchd service, or any process that didn't
+        # `source .env`), the caller silently lands in `~/.sutando/workspace/`
+        # while the rest of the fleet uses the override → split-brain. One
+        # stderr line per process makes the miss visible. We do NOT auto-honor
+        # the .env value here — that's a behavior change and lives in callers
+        # that opt into it (e.g. skills/agent-registry/scripts/_workspace_resolve.py).
+        global _FALLBACK_WARN_PRINTED
+        if not _FALLBACK_WARN_PRINTED:
+            _FALLBACK_WARN_PRINTED = True
+            env_file_val = _grep_env_for_workspace()
+            if env_file_val and env_file_val != str(target):
+                print(
+                    f"workspace: SUTANDO_WORKSPACE is unset in process env, "
+                    f"falling back to {target}. NOTE: .env declares "
+                    f"SUTANDO_WORKSPACE={env_file_val!r} which is NOT being "
+                    f"honored here — `source .env` or export the var before "
+                    f"this process to avoid split-brain with other services.",
+                    file=sys.stderr,
+                )
+
+    # One-time notice if legacy-state evidence exists, pointing at the
+    # explicit CLI (to land in a follow-up PR). Process-local guard so we
+    # don't spam every poll loop. `migrate=False` keeps the function pure
+    # — useful for callers that just want a path string and have no
+    # interest in side-effects (e.g. test fixtures, status probes).
+    if migrate and not _AUTO_MIGRATE_NOTICE_PRINTED:
+        _AUTO_MIGRATE_NOTICE_PRINTED = True
         try:
-            _migrate_from_legacy(target)
-        except Exception as e:  # pragma: no cover — must never break resolution
-            print(f"workspace migration: skipped due to error: {e}", file=sys.stderr)
-        try:
-            _migrate_inrepo_build_log(target)
-        except Exception as e:  # pragma: no cover — must never break resolution
-            print(f"build_log migration: skipped due to error: {e}", file=sys.stderr)
-        try:
-            _migrate_root_status(target)
-        except Exception as e:  # pragma: no cover — must never break resolution
-            print(f"status migration: skipped due to error: {e}", file=sys.stderr)
-        try:
-            _migrate_conversation_log(target)
-        except Exception as e:  # pragma: no cover — must never break resolution
-            print(f"conversation.log migration: skipped due to error: {e}", file=sys.stderr)
+            repo = _legacy_repo_root()
+            indicators = []
+            if (repo / "notes").is_dir() and not (repo / "notes").is_symlink():
+                # Real (non-symlinked) in-repo notes/ — needs explicit migrate
+                if any((repo / "notes").iterdir()):
+                    indicators.append(f"{repo}/notes/")
+            if (repo / "build_log.md").is_file():
+                indicators.append(f"{repo}/build_log.md")
+            if (repo / "conversation.log").is_file():
+                indicators.append(f"{repo}/conversation.log")
+            if indicators:
+                print(
+                    "workspace: legacy state detected at "
+                    + ", ".join(indicators)
+                    + ". Auto-migration is disabled as of #1169 (option B). "
+                    "Run `bash scripts/sutando-migrate.sh --dry-run` to preview, "
+                    "then `--commit` to relocate.",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass  # never break resolution
+
     return target

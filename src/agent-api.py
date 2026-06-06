@@ -177,6 +177,15 @@ def get_task_result(task_id: str):
     result_file = _safe_path(RESULT_DIR, task_id)
     if result_file and result_file.exists():
         return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
+    # Check archive — task-bridge archives results within seconds of delivery,
+    # so direct /result polls often arrive after the file has been moved.
+    safe_id = _safe_id(task_id)
+    if safe_id:
+        filename = f"{safe_id}.txt"
+        for month_dir in sorted((RESULT_DIR / "archive").glob("*/"), reverse=True):
+            candidate = month_dir / filename
+            if candidate.exists():
+                return {"task_id": safe_id, "status": "completed", "result": candidate.read_text()}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
@@ -304,7 +313,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     data = _json.loads(status_file.read_text())
                     self.send_json(200, data)
-                except:
+                except Exception:
                     self.send_json(200, {"status": "idle"})
             else:
                 self.send_json(200, {"status": "idle"})
@@ -664,7 +673,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = json.loads(body)
                 voice_desired_state = data.get("state", "disconnected")
                 self.send_json(200, {"state": voice_desired_state})
-            except:
+            except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
 
@@ -683,7 +692,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     task_history[tid] = {"status": "done", "text": result[:80], "time": datetime.now().timestamp(), "result": result}
                 self.send_json(200, {"ok": True})
-            except:
+            except Exception:
                 self.send_json(400, {"error": "invalid"})
             return
 

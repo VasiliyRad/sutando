@@ -47,7 +47,7 @@
 import { config as _dotenvConfig } from 'dotenv';
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, readdirSync, renameSync, symlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { voiceApiKey } from '../../../src/voice-key.js';
@@ -84,7 +84,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
 import { recordSession, recordConversation, recordToolCall } from '../../../src/conversation-store.js';
-import { resultBelongsTo } from '../../../src/result-channel-key.js';
+import { resultBelongsTo, phoneCallKey } from '../../../src/result-channel-key.js';
 // Lazy vision-session handle. Only loaded if a call ever needs it — keeps the
 // phone-agent boot path free of the vision-tools.ts side-effects on cold start.
 let _setVisionSession: ((s: unknown) => void) | null = null;
@@ -121,10 +121,50 @@ const PORT = Number(process.env.PHONE_PORT) || 3100;
 const WORKSPACE_DIR = resolveWorkspace();
 const RESULTS_DIR = process.env.PHONE_RESULTS_DIR || join(WORKSPACE_DIR, 'results');
 const TASKS_DIR = join(WORKSPACE_DIR, 'tasks');
+
+// Archive helper — matches src/task-bridge.ts:archiveFile() pattern so phone
+// tasks + results aren't left behind in tasks/ or results/ forever (#1235).
+// Same audit-trail rationale Chi quoted on 2026-04-18 ("instead of deleting
+// we should archive the tasks. It can be useful for self-improving"). Silent
+// on failure; falls back to unlink if renameSync throws for ANY reason
+// (ENOENT race / permission / disk-full) so we never leave stale files.
+// (Note: tasks/ → tasks/archive/ is same-filesystem by construction; EXDEV
+// won't fire — calling out renameSync-failed-for-any-reason rather than
+// implying cross-device portability per liususan091219's #1237 review.)
+function archivePhoneFile(srcPath: string, kind: 'tasks' | 'results', taskId: string): void {
+	try {
+		if (!existsSync(srcPath)) return;
+		const ym = new Date().toISOString().slice(0, 7); // YYYY-MM
+		const baseDir = kind === 'tasks' ? TASKS_DIR : RESULTS_DIR;
+		const destDir = join(baseDir, 'archive', ym);
+		mkdirSync(destDir, { recursive: true });
+		renameSync(srcPath, join(destDir, `${taskId}.txt`));
+	} catch {
+		try { unlinkSync(srcPath); } catch { /* ignore */ }
+	}
+}
+
 const TASK_POLL_INTERVAL_MS = 500;
 const TASK_TIMEOUT_MS = 120_000;
 const OWNER_NAME = process.env.owner ?? '';
 const OWNER_NUMBER = process.env.OWNER_NUMBER ?? '';
+const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
+
+// Build a date-context string injected into the system prompt at session-open
+// so Gemini resolves date-relative phrases ("tomorrow", "this Friday") against
+// the owner's local clock, not UTC or server-local. Without this, US-Pacific
+// owners get an off-by-one whenever a call lands after ~5pm PT (UTC midnight
+// rollover): the model says "tomorrow = May 28" when owner-local says May 27.
+// See sonichi/sutando#1243.
+function ownerLocalDateContext(now: Date = new Date()): string {
+	const tz = OWNER_TZ;
+	const today = now.toLocaleDateString('en-CA', { timeZone: tz }); // YYYY-MM-DD
+	const dayName = now.toLocaleDateString('en-US', { timeZone: tz, weekday: 'long' });
+	const timeStr = now.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+	const tomorrow = new Date(now.getTime() + 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	const yesterday = new Date(now.getTime() - 86_400_000).toLocaleDateString('en-CA', { timeZone: tz });
+	return `Owner-local time: ${dayName}, ${today}, ${timeStr} (${tz}). Tomorrow = ${tomorrow}. Yesterday = ${yesterday}. When the owner says "today", "tomorrow", "yesterday", "this week", etc., resolve against THESE owner-local dates — never against UTC or server-local time. Pass absolute YYYY-MM-DD values to tools (not relative phrases).`;
+}
 
 // Model configuration — text/STT model still env-driven; the native-audio
 // model + googleSearch grounding are per-user config: data, not code, so they
@@ -390,6 +430,13 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 		if (callSession.hangingUp || !activeCalls.has(callSession.callSid)) {
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
+			// Call ended before the result came back — archive the task file
+			// anyway so it doesn't linger in tasks/. The result-watcher in
+			// task-bridge.ts will pick up + archive `results/<task_id>.txt`
+			// independently if the core finishes the work later.
+			// (Per VasiliyRad's review on #1237 — closes the leak in the
+			// hang-up / call-not-active branch.)
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			return;
 		}
 		if (existsSync(resultPath)) {
@@ -398,20 +445,39 @@ function delegateTask(callSession: CallSession, taskDescription: string): Promis
 			const result = readFileSync(resultPath, 'utf-8').trim();
 			console.log(`${ts()} [Task] result for ${taskId} (${Date.now() - startTime}ms): ${result.slice(0, 200)}`);
 			callSession.events.push({ event: `task_result:${taskId}:${Date.now() - startTime}ms`, timestamp: new Date().toISOString() });
-			try { unlinkSync(resultPath); } catch {}
+			// Archive both the result + task files so phone surfaces match the
+			// task-bridge.ts archiveFile() audit-trail pattern (#1235).
+			archivePhoneFile(resultPath, 'results', taskId);
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			// Cache result so duplicate requests get instant replay
 			if (!callSession.taskResultCache) callSession.taskResultCache = new Map();
 			callSession.taskResultCache.set(taskDescription, result);
+			// Anti-hallucination wrapping. See sonichi/sutando#1244 — Gemini
+			// was filling silence with plausible-sounding fabrications when
+			// the work tool returned empty/sparse content. Two layers:
+			// (1) a RESULT_EMPTY sentinel on truly-empty results so the model
+			// has an explicit "say nothing" signal instead of an empty string
+			// it can pattern-fill; (2) an explicit "items present verbatim"
+			// guardrail on every result.
+			const isEmpty = result.length === 0;
+			const injectedText = isEmpty
+				? `[Task result for "${taskDescription}"]\nRESULT_EMPTY — the tool returned no items.\n\nTell the caller plainly that there is nothing to report (e.g. "nothing scheduled", "your inbox is empty", "no matches"). Do NOT invent, guess, or extrapolate any items. Use only the literal RESULT_EMPTY signal.`
+				: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now. Only reference items that appear verbatim in the result above — do NOT invent, fabricate, or extrapolate items that aren't there.`;
 			// Queue result — will be injected on next turn.end to avoid interrupting speech
-			callSession.resultQueue.push({
-				text: `[Task result for "${taskDescription}"]\n${result}\n\nReport this result to the caller now.`,
-			});
+			callSession.resultQueue.push({ text: injectedText });
 			return;
 		}
 		if (Date.now() - startTime > POLL_TIMEOUT_MS) {
 			clearInterval(poll);
 			callSession.pendingTasks = Math.max(0, callSession.pendingTasks - 1);
 			console.log(`${ts()} [Task] timeout for ${taskId}`);
+			// Archive the task file even on timeout — the work may still complete
+			// async on the core side, but the call's polling window is closed.
+			// Don't archive the result file here: if it eventually lands, the
+			// canonical result-watcher in src/task-bridge.ts will archive it
+			// via its own archiveFile() call. (Per liususan091219's #1237
+			// review — avoids redundant result-archive logic here.)
+			archivePhoneFile(taskPath, 'tasks', taskId);
 			try {
 				(callSession.voiceSession as any).transport.sendContent([
 					{ role: 'user', text: `[Task "${taskDescription}" timed out — still being worked on. Let the caller know.]` },
@@ -517,6 +583,14 @@ function buildAgent(callSession: CallSession): MainAgent {
 				'',
 				'## Known info',
 				(() => { try { const url = execSync('git remote get-url origin', { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `Sutando GitHub repo: ${url}`; } catch { return ''; } })(),
+				ownerLocalDateContext(),
+				// Session-level anti-hallucination backstop (cherry-picked from
+				// bassilkhilo-ag2's parallel PR #1249). Pre-warms the model
+				// with the constraint at session-open so the rule is in scope
+				// BEFORE any result-injection wrapper lands. Combined with the
+				// per-result wrapper below at conversation-server.ts:405, the
+				// model gets the rule twice: at boot and at delivery.
+				'TOOL RESULT TRUTHFULNESS: When a work task result is empty or says nothing was found, you MUST say "nothing scheduled" or "nothing found" — never invent, guess, or fill with plausible-sounding calendar events, emails, or other items. Fabricated events mislead the owner and are worse than silence.',
 				'',
 				'## Style',
 				'Be natural, warm, and conversational. Keep responses to 1-2 sentences.',
@@ -785,7 +859,11 @@ async function createCallSession(params: {
 				callSession.toolCalls.push({ name: toolName, durationMs: e.durationMs, timestamp: new Date().toISOString() });
 				// tool_result event push removed per #1052 — recordToolCall
 				// below is the canonical write (phone table, kind='tool_call').
-				recordToolCall('phone', toolName, e.durationMs, callSession.sessionId);
+				// Phone tool_call rows must key on callSid (same as recordConversation
+				// at the user/agent write below) — CallSession has no `sessionId` field,
+				// so the old `callSession.sessionId` wrote NULL and diagnose.py's
+				// `session_id OR call_sid` loader could never join them (Echo, #1357 review).
+				recordToolCall('phone', toolName, e.durationMs, callSession.callSid);
 				// Log REC indicator status for recording tools
 				if (toolName === 'record_screen_with_narration' || toolName === 'screen_record' || toolName === 'open_file') {
 					const hasIndicator = existsSync('/tmp/sutando-rec-indicator.pid');
@@ -878,6 +956,12 @@ async function createCallSession(params: {
 			if (item.content === lastTranscriptText) continue;
 			if (item.role === 'user') {
 				callSession.transcript.push({ role: 'caller', text: item.content });
+					// Real-time sqlite mirror so the phone table gets a per-utterance
+					// timestamp (was batch-written at cleanup -> every phone row had the
+					// end-of-call ts, breaking diagnose.py's timeline ordering; #1357 review
+					// -- Echo). The dedup guard above (item.content === lastTranscriptText)
+					// prevents double-writes across reconnects.
+					recordConversation('phone-caller', item.content, callSession.callSid);
 				// caller event push removed per #1052 — canonical record is
 				// the phone-table row written via recordConversation (called
 				// elsewhere in this server). session_events keeps only
@@ -885,6 +969,7 @@ async function createCallSession(params: {
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date(Date.now() - 12000).toLocaleTimeString('en-US', {hour12:false})}] Caller: ${item.content}\n`); } catch {}
 			} else if (item.role === 'assistant') {
 				callSession.transcript.push({ role: 'sutando', text: item.content });
+					recordConversation('phone-agent', item.content, callSession.callSid);
 				// sutando event push removed per #1052 — see comment above.
 				try { appendFileSync(`/tmp/sutando-live-transcript-${callSession.callSid}.txt`, `[${new Date().toLocaleTimeString('en-US', {hour12:false})}] Sutando: ${item.content}\n`); } catch {}
 			}
@@ -997,7 +1082,9 @@ async function createCallSession(params: {
 			// Belt-and-suspenders: `resultBelongsTo` also gates on .txt.
 			if (!name.endsWith('.txt')) continue;
 			if (callSession.channelScanSeen!.has(name)) continue;
-			if (!resultBelongsTo(name, callSession.callSid)) continue;
+			// Typed key constructor — keeps writer + consumer in sync on
+			// the `phone-` prefix; prevents cross-consumer namespace collisions.
+			if (!resultBelongsTo(name, phoneCallKey(callSession.callSid))) continue;
 			callSession.channelScanSeen!.set(name, Date.now());
 			const full = join(RESULTS_DIR, name);
 			let body: string;
@@ -1087,7 +1174,8 @@ function cleanupCall(callSid: string): void {
 			const text = `[${callType}] ${t.text.replace(/\n/g, ' ').slice(0, 200)}`;
 			const line = `${new Date().toISOString()}|${role}|${text}\n`;
 			try { appendFileSync(logPath, line); } catch { /* best effort */ }
-			recordConversation(role, text, callSid); // #603 sqlite mirror
+			// recordConversation moved to the real-time turn handler (#1357 review -- Echo);
+			// cleanup only mirrors to conversation.log to avoid duplicate phone-table rows.
 		}
 	}
 	console.log(`${ts()} [Phone] call finalized: ${callSid}`);
